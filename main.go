@@ -1,387 +1,176 @@
-package proxy
+package main
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
+	"flag"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
-	"net/url"
-	"strings"
-	"sync"
+	"os"
+	"strconv"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-
-	"github.com/teslamotors/vehicle-command/internal/authentication"
 	"github.com/teslamotors/vehicle-command/internal/log"
-	"github.com/teslamotors/vehicle-command/pkg/account"
-	"github.com/teslamotors/vehicle-command/pkg/cache"
-	"github.com/teslamotors/vehicle-command/pkg/connector/inet"
+	"github.com/teslamotors/vehicle-command/pkg/cli"
 	"github.com/teslamotors/vehicle-command/pkg/protocol"
-	"github.com/teslamotors/vehicle-command/pkg/vehicle"
+	"github.com/teslamotors/vehicle-command/pkg/proxy"
 )
 
 const (
-	DefaultTimeout       = 10 * time.Second
-	maxRequestBodyBytes  = 512
-	vinLength            = 17
-	proxyProtocolVersion = "tesla-http-proxy/1.1.0"
+	cacheSize   = 10000 // Number of cached vehicle sessions
+	defaultPort = 443
 )
 
-func getAccount(req *http.Request) (*account.Account, error) {
-	token, ok := strings.CutPrefix(req.Header.Get("Authorization"), "Bearer ")
-	if !ok {
-		return nil, fmt.Errorf("client did not provide an OAuth token")
+const (
+	EnvTlsCert = "TESLA_HTTP_PROXY_TLS_CERT"
+	EnvTlsKey  = "TESLA_HTTP_PROXY_TLS_KEY"
+	EnvHost    = "TESLA_HTTP_PROXY_HOST"
+	EnvPort    = "TESLA_HTTP_PROXY_PORT"
+	EnvTimeout = "TESLA_HTTP_PROXY_TIMEOUT"
+	EnvVerbose = "TESLA_VERBOSE"
+)
+
+const nonLocalhostWarning = `
+Do not listen on a network interface without adding client authentication. Unauthorized clients may
+be used to create excessive traffic from your IP address to Tesla's servers, which Tesla may respond
+to by rate limiting or blocking your connections.`
+
+type HttpProxyConfig struct {
+	keyFilename  string
+	certFilename string
+	verbose      bool
+	host         string
+	port         int
+	timeout      time.Duration
+}
+
+var (
+	httpConfig = &HttpProxyConfig{}
+)
+
+func init() {
+	flag.StringVar(&httpConfig.certFilename, "cert", "", "TLS certificate chain `file` with concatenated server, intermediate CA, and root CA certificates")
+	flag.StringVar(&httpConfig.keyFilename, "tls-key", "", "Server TLS private key `file`")
+	flag.BoolVar(&httpConfig.verbose, "verbose", false, "Enable verbose logging")
+	flag.StringVar(&httpConfig.host, "host", "localhost", "Proxy server `hostname`")
+	flag.IntVar(&httpConfig.port, "port", defaultPort, "`Port` to listen on")
+	flag.DurationVar(&httpConfig.timeout, "timeout", proxy.DefaultTimeout, "Timeout interval when sending commands")
+}
+
+func Usage() {
+	out := flag.CommandLine.Output()
+	fmt.Fprintf(out, "Usage: %s [OPTION...]\n", os.Args[0])
+	fmt.Fprintf(out, "\nA server that exposes a REST API for sending commands to Tesla vehicles")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, nonLocalhostWarning)
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Options:")
+	flag.PrintDefaults()
+}
+
+func main() {
+	config, err := cli.NewConfig(cli.FlagPrivateKey)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load credential configuration: %s\n", err)
+		os.Exit(1)
 	}
-	return account.New(token, proxyProtocolVersion)
-}
 
-// Proxy exposes an HTTP API for sending vehicle commands.
-type Proxy struct {
-	Timeout time.Duration
-
-	commandKey  protocol.ECDHPrivateKey
-	sessions    *cache.SessionCache
-	vinLock     sync.Map
-	unsupported sync.Map
-}
-
-func (p *Proxy) markUnsupportedVIN(vin string) {
-	p.unsupported.Store(vin, true)
-}
-
-func (p *Proxy) isNotSupported(vin string) bool {
-	_, ok := p.unsupported.Load(vin)
-	return ok
-}
-
-// lockVIN locks a VIN-specific mutex, blocking until the operation succeeds or ctx expires.
-func (p *Proxy) lockVIN(ctx context.Context, vin string) error {
-	lock := make(chan bool, 1)
-	for {
-		if obj, loaded := p.vinLock.LoadOrStore(vin, lock); loaded {
-			select {
-			case <-obj.(chan bool):
-				// The goroutine that reads from the channel doesn't necessarily own the mutex. This
-				// allows the mutex owner to delete the entry from the map, limiting the size of the
-				// map to the number of concurrent vehicle commands.
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		} else {
-			return nil
-		}
-	}
-}
-
-// unlockVIN releases a VIN-specific mutex.
-func (p *Proxy) unlockVIN(vin string) {
-	obj, ok := p.vinLock.Load(vin)
-	if !ok {
-		panic("called unlock without owning mutex")
-	}
-	p.vinLock.Delete(vin)  // Allow someone else to claim the mutex
-	close(obj.(chan bool)) // Unblock goroutines
-}
-
-// New creates an http proxy.
-//
-// Vehicles must have the public part of skey enrolled on their keychains. (This is a
-// command-authentication key, not a TLS key.)
-func New(ctx context.Context, skey protocol.ECDHPrivateKey, cacheSize int) (*Proxy, error) {
-	return &Proxy{
-		Timeout:    DefaultTimeout,
-		commandKey: skey,
-		sessions:   cache.New(cacheSize),
-	}, nil
-}
-
-// Response contains a server's response to a client request.
-type Response struct {
-	Response   interface{} `json:"response"`
-	Error      string      `json:"error"`
-	ErrDetails string      `json:"error_description"`
-}
-
-type carResponse struct {
-	Result bool   `json:"result"`
-	Reason string `json:"string"`
-}
-
-func writeJSONError(w http.ResponseWriter, code int, err error) {
-	reply := Response{}
-
-	var httpErr *inet.HttpError
-	var jsonBytes []byte
-	if errors.As(err, &httpErr) {
-		code = httpErr.Code
-		jsonBytes = []byte(err.Error())
-	} else {
-		if err == nil {
-			reply.Error = http.StatusText(code)
-		} else if protocol.IsNominalError(err) {
-			// Response came from the car as opposed to Tesla's servers
-			reply.Response = &carResponse{Reason: err.Error()}
-		} else {
-			reply.Error = err.Error()
-		}
-		jsonBytes, err = json.Marshal(&reply)
+	defer func() {
 		if err != nil {
-			log.Error("Error serializing reply %+v: %s", &reply, err)
-			code = http.StatusInternalServerError
-			jsonBytes = []byte("{\"error\": \"internal server error\"}")
+			fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+			os.Exit(1)
 		}
+	}()
+
+	flag.Usage = Usage
+	config.RegisterCommandLineFlags()
+	flag.Parse()
+	readFromEnvironment()
+	config.ReadFromEnvironment()
+
+	if httpConfig.verbose {
+		log.SetLevel(log.LevelDebug)
 	}
-	if code != http.StatusOK {
-		log.Error("Returning error %s", http.StatusText(code))
+
+	if httpConfig.host != "localhost" {
+		fmt.Fprintln(os.Stderr, nonLocalhostWarning)
 	}
-	w.WriteHeader(code)
-	w.Header().Add("Content-Type", "application/json")
-	jsonBytes = append(jsonBytes, '\n')
-	w.Write(jsonBytes)
-}
 
-var connectionHeaders = []string{
-	"Proxy-Connection",
-	"Keep-Alive",
-	"Transfer-Encoding",
-	"Te",
-	"Upgrade",
-}
-
-// forwardRequest is the fallback handler for "/api/1/*".
-// It forwards GET and POST requests to Tesla using the proxy's OAuth token.
-func (p *Proxy) forwardRequest(host string, w http.ResponseWriter, req *http.Request) {
-	ctx, cancel := context.WithTimeout(context.Background(), p.Timeout)
-	defer cancel()
-
-	proxyReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL.String(), req.Body)
+	var skey protocol.ECDHPrivateKey
+	skey, err = config.PrivateKey()
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err)
-		return
-	}
-	proxyReq.Header = req.Header.Clone()
-	// Remove per-hop headers
-	for _, hdr := range connectionHeaders {
-		proxyReq.Header.Del(hdr)
-	}
-
-	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	const xff = "X-Forwarded-For"
-	previous := req.Header.Values(xff)
-	if len(previous) == 0 {
-		proxyReq.Header.Add(xff, clientIP)
-	} else {
-		previous = append(previous, clientIP)
-		// If the client sent multiple XFF headers, flatten them.
-		proxyReq.Header.Set(xff, strings.Join(previous, ", "))
-	}
-	proxyReq.URL.Host = host
-	proxyReq.URL.Scheme = "https"
-
-	log.Debug("Forwarding request to %s", proxyReq.URL.String())
-	client := http.Client{}
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		if urlErr, ok := err.(*url.Error); ok && urlErr.Timeout() {
-			writeJSONError(w, http.StatusGatewayTimeout, urlErr)
-		} else {
-			writeJSONError(w, http.StatusBadGateway, err)
-		}
-		return
-	}
-	defer resp.Body.Close()
-
-	for _, hdr := range connectionHeaders {
-		resp.Header.Del(hdr)
-	}
-	outHeader := w.Header()
-	for name, value := range resp.Header {
-		outHeader[name] = value
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
-
-func (p *Proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	log.Info("Received %s request for %s", req.Method, req.URL.Path)
-
-	acct, err := getAccount(req)
-	if err != nil {
-		writeJSONError(w, http.StatusForbidden, err)
-		return
-	}
-
-	if strings.HasPrefix(req.URL.Path, "/api/1/vehicles/") {
-		path := strings.Split(req.URL.Path, "/")
-		if len(path) == 7 && path[5] == "command" {
-			command := path[6]
-			vin := path[4]
-			if len(vin) != vinLength {
-				writeJSONError(w, http.StatusNotFound, errors.New("expected 17-character VIN in path (do not user Fleet API ID)"))
-				return
-			}
-			if p.isNotSupported(vin) {
-				p.forwardRequest(acct.Host, w, req)
-			} else {
-				if err := p.handleVehicleCommand(acct, w, req, command, vin); err == ErrCommandUseRESTAPI {
-					p.forwardRequest(acct.Host, w, req)
-				}
-			}
-			return
-		}
-		if len(path) == 5 && path[4] == "fleet_telemetry_config" {
-			p.handleFleetTelemetryConfig(acct.Host, w, req)
+	if tlsPublicKey, err := protocol.LoadPublicKey(httpConfig.keyFilename); err == nil {
+		if bytes.Equal(tlsPublicKey.Bytes(), skey.PublicBytes()) {
+			fmt.Fprintln(os.Stderr, "It is unsafe to use the same private key for TLS and command authentication.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "Generate a new TLS key for this server.")
 			return
 		}
 	}
-	p.forwardRequest(acct.Host, w, req)
+
+	log.Debug("Creating proxy")
+	p, err := proxy.New(context.Background(), skey, cacheSize)
+	if err != nil {
+		return
+	}
+	p.Timeout = httpConfig.timeout
+	addr := fmt.Sprintf("%s:%d", httpConfig.host, httpConfig.port)
+	log.Info("Listening on %s", addr)
+
+	// To add more application logic requests, such as alternative client authentication, create
+	// a http.HandleFunc implementation (https://pkg.go.dev/net/http#HandlerFunc). The ServeHTTP
+	// method of your implementation can perform your business logic and then, if the request is
+	// authorized, invoke p.ServeHTTP. Finally, replace p in the below ListenAndServeTLS call with
+	// an object of your newly created type.
+	log.Error("Server stopped: %s", http.ListenAndServeTLS(addr, httpConfig.certFilename, httpConfig.keyFilename, p))
 }
 
-func (p *Proxy) handleFleetTelemetryConfig(host string, w http.ResponseWriter, req *http.Request) {
-	log.Info("Processing fleet telemetry configuration...")
-	defer req.Body.Close()
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("could not read request body: %s", err))
-		return
-	}
-	var params struct {
-		VINs   []string      `json:"vins"`
-		Config jwt.MapClaims `json:"config"`
-	}
-	if err := json.Unmarshal(body, &params); err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("could not parse JSON body: %s", err))
-		return
+// readConfig applies configuration from environment variables.
+// Values are not overwritten.
+func readFromEnvironment() error {
+	if httpConfig.certFilename == "" {
+		httpConfig.certFilename = os.Getenv(EnvTlsCert)
 	}
 
-	// Let the server validate the VINs and config, the proxy just needs to sign
-	if _, ok := params.Config["aud"]; ok {
-		log.Warning("Confuration 'aud' field will be overwritten")
-	}
-	if _, ok := params.Config["iss"]; ok {
-		log.Warning("Configuration 'iss' field will be overwritten")
-	}
-	token, err := authentication.SignMessageForFleet(p.commandKey, "TelemetryClient", params.Config)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Errorf("error signing configuration: %s", err))
-		return
+	if httpConfig.keyFilename == "" {
+		httpConfig.keyFilename = os.Getenv(EnvTlsKey)
 	}
 
-	// Forward the new request to Tesla's servers
-	jwtRequest := make(map[string]interface{})
-	jwtRequest["vins"] = params.VINs
-	jwtRequest["token"] = token
-	bodyJSON, err := json.Marshal(jwtRequest)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Errorf("error while serializing a request: %s", err))
-		return
-	}
-	req.Body = io.NopCloser(bytes.NewReader(bodyJSON))
-	req.URL, err = req.URL.Parse("/api/1/vehicles/fleet_telemetry_config_jws")
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Errorf("error creating proxied URL: %s", err))
-		return
-	}
-	log.Debug("Posting data to %s: %s", req.URL.String(), bodyJSON)
-	p.forwardRequest(host, w, req)
-}
-
-func (p *Proxy) handleVehicleCommand(acct *account.Account, w http.ResponseWriter, req *http.Request, command, vin string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), p.Timeout)
-	defer cancel()
-
-	// Serialize commands sent to a specific VIN to avoid some complexities associated with sharing
-	// the vehicle.Vehicle object. VCSEC commands fail if they arrive out of order, anyway.
-	if err := p.lockVIN(ctx, vin); err != nil {
-		writeJSONError(w, http.StatusServiceUnavailable, err)
-		return err
-	}
-	defer p.unlockVIN(vin)
-
-	car, commandToExecuteFunc, err := p.loadVehicleAndCommandFromRequest(ctx, acct, w, req, command, vin)
-	if err != nil {
-		return err
+	if httpConfig.host == "localhost" {
+		host, ok := os.LookupEnv(EnvHost)
+		if ok {
+			httpConfig.host = host
+		}
 	}
 
-	if err := car.Connect(ctx); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err)
-		return err
-	}
-	defer car.Disconnect()
-
-	if err := car.StartSession(ctx, nil); errors.Is(err, protocol.ErrProtocolNotSupported) {
-		p.markUnsupportedVIN(vin)
-		p.forwardRequest(acct.Host, w, req)
-		return err
-	} else if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err)
-		return err
-	}
-	defer car.UpdateCachedSessions(p.sessions)
-
-	if err = commandToExecuteFunc(car); err == ErrCommandUseRESTAPI {
-		return err
-	}
-	if protocol.IsNominalError(err) {
-		writeJSONError(w, http.StatusOK, err)
-		return err
-	}
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err)
-		return err
+	if !httpConfig.verbose {
+		if verbose, ok := os.LookupEnv(EnvVerbose); ok {
+			httpConfig.verbose = verbose != "false" && verbose != "0"
+		}
 	}
 
-	w.Header().Add("Content-Type", "application/json")
-	fmt.Fprintln(w, "{\"response\":{\"result\":true,\"reason\":\"\"}}")
+	var err error
+	if httpConfig.port == defaultPort {
+		if port, ok := os.LookupEnv(EnvPort); ok {
+			httpConfig.port, err = strconv.Atoi(port)
+			if err != nil {
+				return fmt.Errorf("invalid port: %s", port)
+			}
+		}
+	}
+
+	if httpConfig.timeout == proxy.DefaultTimeout {
+		if timeoutEnv, ok := os.LookupEnv(EnvTimeout); ok {
+			httpConfig.timeout, err = time.ParseDuration(timeoutEnv)
+			if err != nil {
+				return fmt.Errorf("invalid timeout: %s", timeoutEnv)
+			}
+		}
+	}
+
 	return nil
-}
-
-func (p *Proxy) loadVehicleAndCommandFromRequest(ctx context.Context, acct *account.Account, w http.ResponseWriter, req *http.Request,
-	command, vin string) (*vehicle.Vehicle, func(*vehicle.Vehicle) error, error) {
-
-	log.Debug("Executing %s on %s", command, vin)
-	if req.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, nil)
-		return nil, nil, fmt.Errorf("wrong http method")
-	}
-
-	commandToExecuteFunc, err := extractCommandAction(ctx, req, command)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err)
-		return nil, nil, err
-	}
-
-	car, err := acct.GetVehicle(ctx, vin, p.commandKey, p.sessions)
-	if err != nil || car == nil {
-		writeJSONError(w, http.StatusInternalServerError, err)
-		return nil, nil, err
-	}
-
-	return car, commandToExecuteFunc, err
-}
-
-func extractCommandAction(ctx context.Context, req *http.Request, command string) (func(*vehicle.Vehicle) error, error) {
-	var params RequestParameters
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, &inet.HttpError{Code: http.StatusBadRequest, Message: "could not read request body"}
-	}
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &params); err != nil {
-			return nil, &inet.HttpError{Code: http.StatusBadRequest, Message: "error occurred while parsing request parameters"}
-		}
-	}
-
-	return ExtractCommandAction(ctx, command, params)
 }
